@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#c7965b">
+  <meta name="description" content="Radio Indie88 FM ao vivo com identificação automática das músicas.">
+
+  <title>{{ config.name }}</title>
+
+  <link rel="icon" href="/default-cover.webp" type="image/webp">
+  <link rel="preload" href="/default-cover.webp" as="image" type="image/webp">
+  <link rel="stylesheet" href="/style.css?v=4">
+</head>
+
+<body>
+  <div class="bg-orbs" aria-hidden="true">
+    <span></span>
+    <span></span>
+    <span></span>
+  </div>
+
+  <main class="app">
+    <header class="hero">
+      <div class="brand">
+        <div class="brand-logo" aria-hidden="true">
+          <span>88</span>
+        </div>
+
+        <div>
+          <h1>{{ config.name }}</h1>
+          <p>Indie, alternative &amp; fresh sounds</p>
+        </div>
+      </div>
+
+      <div class="live-pill" id="livePill">
+        <span class="live-dot"></span>
+        <span id="liveText">OFFLINE</span>
+      </div>
+    </header>
+
+    <section class="player-card">
+      <div class="cover-wrap">
+        <div class="cover-glow"></div>
+
+        <img
+          id="cover"
+          class="cover"
+          src="/default-cover.webp"
+          width="900"
+          height="900"
+          alt="Capa da Radio Indie88 FM"
+        >
+
+        <div class="vinyl-ring" aria-hidden="true"></div>
+      </div>
+
+      <div class="player-info">
+        <p class="eyebrow">Agora a tocar</p>
+
+        <h2 id="trackTitle">{{ config.name }}</h2>
+        <p id="trackArtist">Stream ao vivo</p>
+
+        <div class="status-box">
+          <div>
+            <span class="small-label">Estado</span>
+            <strong id="statusText">Rádio desligada</strong>
+          </div>
+
+          <div>
+            <span class="small-label">Identificação</span>
+            <strong id="identifyStatus">Shazam pronto</strong>
+          </div>
+        </div>
+
+        <div class="visualizer" id="visualizer" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span>
+        </div>
+
+        <div class="controls">
+          <button id="playBtn" class="main-btn" type="button" aria-pressed="false">
+            <span id="playIcon">▶</span>
+            <span id="playText">Ligar Rádio</span>
+          </button>
+
+          <button id="identifyBtn" class="circle-btn" type="button" title="Identificar música" aria-label="Identificar música">
+            🔎
+          </button>
+
+          <button id="muteBtn" class="circle-btn" type="button" title="Ligar ou desligar som" aria-label="Ligar ou desligar som">
+            🔊
+          </button>
+
+          <button id="reloadBtn" class="circle-btn" type="button" title="Recarregar stream" aria-label="Recarregar stream">
+            ⟳
+          </button>
+        </div>
+
+        <div class="volume-row">
+          <label for="volumeSlider">Volume</label>
+          <input id="volumeSlider" type="range" min="0" max="1" step="0.01" value="0.85">
+          <strong id="volumeText">85%</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="panels">
+      <div class="panel">
+        <div class="panel-header">
+          <h3>Histórico</h3>
+          <button id="clearHistoryBtn" type="button">Limpar</button>
+        </div>
+
+        <div id="historyList" class="list empty">
+          Ainda não há histórico.
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h3>Top 10 Tocadas</h3>
+          <button id="clearTopBtn" type="button">Limpar</button>
+        </div>
+
+        <div id="topList" class="list empty">
+          Ainda não há top.
+        </div>
+      </div>
+    </section>
+
+    <section class="stream-box">
+      <h3>Stream usado</h3>
+      <div class="stream-line">
+        <code id="streamUrl">{{ config.stream }}</code>
+        <button id="copyBtn" type="button">Copiar</button>
+      </div>
+    </section>
+  </main>
+
+  <audio id="radioAudio" preload="none"></audio>
+
+  <script>
+    window.RADIO_CONFIG = {{ config | tojson }};
+  </script>
+  <script src="/script.js?v=4" defer></script>
+</body>
+</html>
