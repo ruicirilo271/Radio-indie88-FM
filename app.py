@@ -1,6 +1,8 @@
 import asyncio
 import os
 import re
+import subprocess
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -8,7 +10,8 @@ from threading import Lock
 from typing import Any
 
 import requests
-from flask import Flask, jsonify, render_template, send_from_directory
+from flask import Flask, jsonify, render_template, request, send_from_directory
+from imageio_ffmpeg import get_ffmpeg_exe
 from shazamio import Shazam
 
 
@@ -21,7 +24,7 @@ app = Flask(
     static_folder=None,
 )
 
-BUILD_ID = "indie88-vercel-v5-20260612"
+BUILD_ID = "indie88-vercel-v6-logica-cascais-20260612"
 
 RADIO_NAME = os.getenv("RADIO_NAME", "Radio Indie88 FM").strip()
 RADIO_STREAM = os.getenv(
@@ -38,10 +41,10 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
-IDENTIFY_SECONDS = env_int("IDENTIFY_SECONDS", 12, 7, 18)
-IDENTIFY_CACHE_SECONDS = env_int("IDENTIFY_CACHE_SECONDS", 45, 20, 180)
-MAX_AUDIO_BYTES = env_int("MAX_AUDIO_BYTES", 2_000_000, 250_000, 4_000_000)
-MIN_AUDIO_BYTES = 20_000
+# Mesma lógica da versão funcional: ficheiro WAV real em /tmp.
+CAPTURE_SECONDS = env_int("SHAZAM_SAMPLE_SECONDS", 18, 10, 22)
+IDENTIFY_CACHE_SECONDS = env_int("IDENTIFY_CACHE_SECONDS", 55, 20, 180)
+MIN_SAMPLE_BYTES = 180_000
 DEFAULT_COVER = "/default-cover.webp"
 
 identify_lock = Lock()
@@ -67,55 +70,112 @@ def normalize_text(value: str) -> str:
     return " ".join(value.split())
 
 
-def capture_stream_bytes() -> tuple[bytes, str]:
-    """Recolhe uma pequena amostra do stream sem usar FFmpeg."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Indie88-Vercel/1.0)",
-        "Accept": "audio/aac,audio/mpeg,audio/*;q=0.9,*/*;q=0.5",
-        "Icy-MetaData": "0",
-        "Cache-Control": "no-cache",
-    }
-
-    started = time.monotonic()
-    audio = bytearray()
-
-    with requests.get(
-        RADIO_STREAM,
-        headers=headers,
-        stream=True,
-        allow_redirects=True,
-        timeout=(8, IDENTIFY_SECONDS + 12),
-    ) as response:
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "audio/unknown").split(";", 1)[0]
-
-        for chunk in response.iter_content(chunk_size=16_384):
-            if chunk:
-                audio.extend(chunk)
-
-            elapsed = time.monotonic() - started
-            if elapsed >= IDENTIFY_SECONDS or len(audio) >= MAX_AUDIO_BYTES:
-                break
-
-    if len(audio) < MIN_AUDIO_BYTES:
-        raise RuntimeError(
-            f"A amostra ficou demasiado pequena ({len(audio)} bytes)."
-        )
-
-    return bytes(audio), content_type
+def ffmpeg_path() -> str:
+    """Devolve o FFmpeg incluído no wheel do imageio-ffmpeg."""
+    binary = get_ffmpeg_exe()
+    if not binary or not Path(binary).exists():
+        raise RuntimeError("O binário FFmpeg incluído no pacote não foi encontrado.")
+    return binary
 
 
-async def recognize_with_shazam(audio_bytes: bytes) -> dict[str, Any]:
+def create_sample_path() -> Path:
+    stamp = f"{os.getpid()}_{int(time.time() * 1000)}"
+    return Path(tempfile.gettempdir()) / f"indie88_shazam_{stamp}.wav"
+
+
+def capture_stream(output_file: Path, seconds: int = CAPTURE_SECONDS) -> dict[str, Any]:
+    """
+    Grava áudio real da rádio num WAV PCM em /tmp.
+
+    Esta é a mesma estratégia da aplicação que funcionou:
+    imageio-ffmpeg -> WAV mono 44.1 kHz -> ficheiro enviado ao Shazam.
+    """
+    errors: list[str] = []
+
+    for attempt in range(1, 3):
+        attempt_seconds = seconds if attempt == 1 else max(12, seconds - 3)
+        output_file.unlink(missing_ok=True)
+
+        command = [
+            ffmpeg_path(),
+            "-hide_banner",
+            "-loglevel", "error",
+            "-nostdin",
+            "-y",
+            "-user_agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/149 Safari/537.36",
+            "-headers",
+            "Accept: audio/aac,audio/mpeg,audio/*;q=0.9,*/*;q=0.8\r\n"
+            "Icy-MetaData: 0\r\n"
+            "Accept-Encoding: identity\r\n"
+            "Cache-Control: no-cache\r\n",
+            "-rw_timeout", "12000000",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_on_network_error", "1",
+            "-reconnect_on_http_error", "4xx,5xx",
+            "-reconnect_delay_max", "3",
+            "-i", RADIO_STREAM,
+            "-t", str(attempt_seconds),
+            "-vn",
+            "-map_metadata", "-1",
+            "-af", "highpass=f=80,lowpass=f=15000,loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-ac", "1",
+            "-ar", "44100",
+            "-c:a", "pcm_s16le",
+            str(output_file),
+        ]
+
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=attempt_seconds + 15,
+                check=False,
+            )
+            elapsed = round(time.monotonic() - started, 2)
+            size = output_file.stat().st_size if output_file.exists() else 0
+
+            if result.returncode == 0 and size >= MIN_SAMPLE_BYTES:
+                return {
+                    "attempt": attempt,
+                    "seconds": attempt_seconds,
+                    "sample_bytes": size,
+                    "capture_elapsed": elapsed,
+                    "format": "wav-pcm-s16le-mono-44100",
+                }
+
+            detail = (result.stderr or "O stream não forneceu áudio suficiente.").strip()
+            errors.append(
+                f"tentativa {attempt}: retorno={result.returncode}, bytes={size}, "
+                f"detalhe={detail[-600:]}"
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(f"tentativa {attempt}: tempo limite da captura")
+        except Exception as exc:
+            errors.append(f"tentativa {attempt}: {type(exc).__name__}: {exc}")
+
+        if attempt == 1:
+            time.sleep(1.5)
+
+    output_file.unlink(missing_ok=True)
+    raise RuntimeError("Não consegui criar uma amostra WAV válida. " + " | ".join(errors))
+
+
+async def recognize_file(audio_file: Path) -> dict[str, Any]:
     shazam = Shazam(
         language="en-US",
         endpoint_country="CA",
-        segment_duration_seconds=min(10, IDENTIFY_SECONDS),
+        segment_duration_seconds=min(10, CAPTURE_SECONDS),
     )
-    return await asyncio.wait_for(shazam.recognize(audio_bytes), timeout=25)
+    return await asyncio.wait_for(shazam.recognize(str(audio_file)), timeout=30)
 
 
-def run_shazam(audio_bytes: bytes) -> dict[str, Any]:
-    return asyncio.run(recognize_with_shazam(audio_bytes))
+def run_shazam(audio_file: Path) -> dict[str, Any]:
+    return asyncio.run(recognize_file(audio_file))
 
 
 def extract_shazam_track(data: dict[str, Any] | None) -> dict[str, str] | None:
@@ -127,9 +187,11 @@ def extract_shazam_track(data: dict[str, Any] | None) -> dict[str, str] | None:
         return None
 
     title = str(track.get("title") or "").strip()
-    artist = str(track.get("subtitle") or "").strip()
-    if not title or not artist:
+    artist = str(track.get("subtitle") or track.get("artist") or "").strip()
+    if not title:
         return None
+    if not artist:
+        artist = "Artista desconhecido"
 
     images = track.get("images") or {}
     shazam_cover = ""
@@ -150,9 +212,10 @@ def extract_shazam_track(data: dict[str, Any] | None) -> dict[str, str] | None:
                 continue
             key = str(item.get("title") or "").lower()
             value = str(item.get("text") or "").strip()
-            if "album" in key and value:
-                album = value
-                break
+            if key in {"album", "álbum"} or "album" in key:
+                if value:
+                    album = value
+                    break
         if album:
             break
 
@@ -161,6 +224,7 @@ def extract_shazam_track(data: dict[str, Any] | None) -> dict[str, str] | None:
         "artist": artist,
         "album": album,
         "shazam_cover": shazam_cover,
+        "shazam_url": str(track.get("url") or ""),
     }
 
 
@@ -221,12 +285,12 @@ def get_itunes_cover(title: str, artist: str) -> str:
     return artwork_600(str(best_item.get("artworkUrl100") or ""))
 
 
-def failed_identification(message: str, artist: str = "Não identificado") -> dict[str, Any]:
-    return {
+def failed_identification(message: str, **details: Any) -> dict[str, Any]:
+    response = {
         "ts": time.time(),
         "ok": False,
         "title": RADIO_NAME,
-        "artist": artist,
+        "artist": "Não identificado",
         "album": "",
         "cover": DEFAULT_COVER,
         "shazam_cover": "",
@@ -235,6 +299,8 @@ def failed_identification(message: str, artist: str = "Não identificado") -> di
         "message": message,
         "build": BUILD_ID,
     }
+    response.update(details)
+    return response
 
 
 def identify_current_song(force: bool = False) -> dict[str, Any]:
@@ -249,17 +315,31 @@ def identify_current_song(force: bool = False) -> dict[str, Any]:
         if not force and now - float(last_identification.get("ts", 0)) < IDENTIFY_CACHE_SECONDS:
             return last_identification
 
+        audio_file = create_sample_path()
+        sample_info: dict[str, Any] = {}
+
         try:
-            audio_bytes, content_type = capture_stream_bytes()
-            shazam_raw = run_shazam(audio_bytes)
+            sample_info = capture_stream(audio_file)
+            shazam_raw = run_shazam(audio_file)
             track = extract_shazam_track(shazam_raw)
+
+            # Em identificação manual, tenta uma segunda parte da emissão se a primeira falhar.
+            if not track and force:
+                audio_file.unlink(missing_ok=True)
+                time.sleep(1.5)
+                second_info = capture_stream(audio_file, seconds=max(12, CAPTURE_SECONDS - 3))
+                sample_info = {
+                    **second_info,
+                    "recognition_attempt": 2,
+                }
+                shazam_raw = run_shazam(audio_file)
+                track = extract_shazam_track(shazam_raw)
 
             if not track:
                 last_identification = failed_identification(
-                    "O Shazam não conseguiu identificar a música neste momento."
+                    "O Shazam não reconheceu esta parte da emissão. Tenta novamente dentro de alguns segundos.",
+                    **sample_info,
                 )
-                last_identification["sample_bytes"] = len(audio_bytes)
-                last_identification["content_type"] = content_type
                 return last_identification
 
             try:
@@ -280,30 +360,34 @@ def identify_current_song(force: bool = False) -> dict[str, Any]:
                 "cover": cover,
                 "shazam_cover": shazam_cover,
                 "itunes_cover": itunes_cover,
+                "shazam_url": track.get("shazam_url", ""),
                 "source": source,
-                "message": "Música identificada com sucesso.",
+                "message": "Música identificada pelo Shazam a partir de uma amostra WAV real.",
                 "build": BUILD_ID,
-                "sample_bytes": len(audio_bytes),
-                "content_type": content_type,
+                **sample_info,
             }
             return last_identification
 
-        except requests.Timeout:
-            last_identification = failed_identification(
-                "O servidor da rádio demorou demasiado tempo a fornecer a amostra."
-            )
-        except requests.RequestException as exc:
-            last_identification = failed_identification(
-                f"Não foi possível aceder ao stream: {exc}"
-            )
         except asyncio.TimeoutError:
             last_identification = failed_identification(
-                "A identificação do Shazam excedeu o tempo disponível."
+                "O Shazam excedeu o tempo disponível para analisar a amostra.",
+                **sample_info,
+            )
+        except subprocess.TimeoutExpired:
+            last_identification = failed_identification(
+                "A captura do áudio excedeu o tempo disponível.",
+                **sample_info,
             )
         except Exception as exc:
             last_identification = failed_identification(
-                f"Erro ao identificar: {type(exc).__name__}: {exc}"
+                f"Erro ao identificar: {type(exc).__name__}: {exc}",
+                **sample_info,
             )
+        finally:
+            try:
+                audio_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         return last_identification
 
@@ -312,10 +396,8 @@ def identify_current_song(force: bool = False) -> dict[str, Any]:
 def add_response_headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-
     if response.content_type and "application/json" in response.content_type:
         response.headers["Cache-Control"] = "no-store, max-age=0"
-
     return response
 
 
@@ -327,14 +409,12 @@ def index():
             "name": RADIO_NAME,
             "stream": RADIO_STREAM,
             "defaultCover": DEFAULT_COVER,
-            "identifySeconds": IDENTIFY_SECONDS,
+            "identifySeconds": CAPTURE_SECONDS,
             "build": BUILD_ID,
         },
     )
 
 
-# Estas rotas tornam a mesma pasta public/ utilizável ao correr localmente.
-# No Vercel, os ficheiros de public/ são servidos diretamente pela CDN.
 @app.get("/style.css")
 def public_style():
     return send_from_directory(PUBLIC_DIR, "style.css")
@@ -354,41 +434,87 @@ def public_default_cover():
 
 @app.get("/api/radio")
 def api_radio():
-    return jsonify(
-        {
-            "ok": True,
-            "name": RADIO_NAME,
-            "stream": RADIO_STREAM,
-            "cover": DEFAULT_COVER,
-            "status": "online",
+    return jsonify({
+        "ok": True,
+        "name": RADIO_NAME,
+        "stream": RADIO_STREAM,
+        "cover": DEFAULT_COVER,
+        "status": "online",
+        "build": BUILD_ID,
+    })
+
+
+@app.get("/api/stream-check")
+def api_stream_check():
+    try:
+        response = requests.get(
+            RADIO_STREAM,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Icy-MetaData": "0",
+                "Accept-Encoding": "identity",
+            },
+            stream=True,
+            allow_redirects=True,
+            timeout=(7, 7),
+        )
+        response.raise_for_status()
+        chunk = next(response.iter_content(chunk_size=512), b"")
+        result = {
+            "ok": bool(chunk),
+            "status": response.status_code,
+            "content_type": response.headers.get("Content-Type", ""),
+            "bytes_received": len(chunk),
+            "final_url": response.url,
             "build": BUILD_ID,
         }
-    )
+        response.close()
+        return jsonify(result), (200 if result["ok"] else 502)
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "build": BUILD_ID,
+        }), 502
 
 
 @app.get("/api/health")
 def api_health():
-    return jsonify(
-        {
-            "ok": True,
-            "app": RADIO_NAME,
-            "platform": "vercel" if os.getenv("VERCEL") else "local",
-            "stream_configured": bool(RADIO_STREAM),
-            "identify_seconds": IDENTIFY_SECONDS,
-            "identification_mode": "raw-stream-bytes",
-            "ffmpeg_required": False,
-            "build": BUILD_ID,
-            "recognizer": "shazamio-core/raw-stream-bytes",
-        }
-    )
+    try:
+        binary = ffmpeg_path()
+        available = bool(binary and Path(binary).exists())
+    except Exception as exc:
+        binary = ""
+        available = False
+        ffmpeg_error = f"{type(exc).__name__}: {exc}"
+    else:
+        ffmpeg_error = ""
+
+    return jsonify({
+        "ok": available,
+        "app": RADIO_NAME,
+        "platform": "vercel" if os.getenv("VERCEL") else "local",
+        "stream_configured": bool(RADIO_STREAM),
+        "capture_seconds": CAPTURE_SECONDS,
+        "identification_mode": "tmp-wav-imageio-ffmpeg",
+        "ffmpeg_available": available,
+        "ffmpeg_path": binary,
+        "ffmpeg_error": ffmpeg_error,
+        "build": BUILD_ID,
+        "recognizer": "shazamio-file-wav",
+    }), (200 if available else 503)
 
 
-@app.get("/api/identify")
+@app.route("/api/identify", methods=["GET", "POST"])
 def api_identify():
-    return jsonify(identify_current_song(force=False))
+    force = (
+        request.method == "POST"
+        or request.args.get("force", "").lower() in {"1", "true", "sim", "yes"}
+    )
+    return jsonify(identify_current_song(force=force))
 
 
-@app.get("/api/identify/force")
+@app.route("/api/identify/force", methods=["GET", "POST"])
 def api_identify_force():
     return jsonify(identify_current_song(force=True))
 

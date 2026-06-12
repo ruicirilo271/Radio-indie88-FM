@@ -1,45 +1,25 @@
-# Radio Indie88 FM — Vercel V5
+# Radio Indie88 FM — Vercel V6
 
-Esta versão corrige o diagnóstico apresentado durante a identificação.
+Esta versão usa a mesma lógica de identificação que funcionou nas outras rádios:
 
-A versão anterior continha no JavaScript uma mensagem que afirmava que o `app.py` era antigo sempre que o texto do erro incluía a palavra FFmpeg. Essa conclusão não era segura. Agora a aplicação:
+1. `imageio-ffmpeg` fornece o binário FFmpeg dentro do pacote Python.
+2. A Function grava uma amostra WAV PCM em `/tmp`.
+3. O WAV é normalizado para mono, 44.1 kHz e enviado ao Shazam.
+4. A capa é procurada no iTunes e, se falhar, usa a capa do Shazam ou a capa default.
 
-- mostra o erro verdadeiro devolvido por `/api/identify`;
-- só avisa sobre versões diferentes quando `config.build` e `data.build` existem e não coincidem;
-- usa o identificador de build também no endereço do CSS e JavaScript para evitar cache antiga;
-- continua a reconhecer bytes diretamente com `shazamio`, sem executar FFmpeg;
-- mantém as capas quadradas e a capa default WebP.
+## Publicação
 
-## Estrutura na raiz do repositório
+Coloca todos os ficheiros na raiz do repositório e faz novo deploy sem alterar Build Command ou Output Directory.
 
-```text
-app.py
-requirements.txt
-vercel.json
-.python-version
-templates/index.html
-public/style.css
-public/script.js
-public/default-cover.webp
-```
+## Testes
 
-## Verificação depois do deploy
+- `/api/health` deve mostrar `ffmpeg_available: true`.
+- `/api/stream-check` deve mostrar `ok: true` e `bytes_received` maior que zero.
+- `/api/identify?force=1` executa uma identificação completa.
 
-Abre:
+## Variáveis opcionais
 
-```text
-https://TEU-PROJETO.vercel.app/api/health?t=123
-```
-
-A resposta correta contém:
-
-```json
-{
-  "ok": true,
-  "build": "indie88-vercel-v5-20260612",
-  "ffmpeg_required": false,
-  "recognizer": "shazamio-core/raw-stream-bytes"
-}
-```
-
-O parâmetro `?t=123` evita que uma resposta anterior guardada em cache confunda o teste.
+- `RADIO_STREAM`
+- `RADIO_NAME`
+- `SHAZAM_SAMPLE_SECONDS` (10 a 22, predefinição 18)
+- `IDENTIFY_CACHE_SECONDS`

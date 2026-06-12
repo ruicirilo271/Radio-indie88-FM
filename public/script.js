@@ -205,15 +205,16 @@ async function identifySong(force = false) {
 
   identifyInProgress = true;
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 40_000);
+  const timeout = window.setTimeout(() => controller.abort(), 95_000);
 
   try {
-    identifyStatus.textContent = "A escutar...";
+    identifyStatus.textContent = force ? "A gravar WAV para o Shazam..." : "A verificar música...";
     identifyBtn.disabled = true;
     identifyBtn.textContent = "⏳";
 
-    const endpoint = force ? "/api/identify/force" : "/api/identify";
+    const endpoint = force ? "/api/identify?force=1" : "/api/identify";
     const response = await fetch(endpoint, {
+      method: force ? "POST" : "GET",
       cache: "no-store",
       signal: controller.signal,
       headers: { Accept: "application/json" }
