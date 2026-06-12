@@ -205,10 +205,10 @@ async function identifySong(force = false) {
 
   identifyInProgress = true;
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 95_000);
+  const timeout = window.setTimeout(() => controller.abort(), 150_000);
 
   try {
-    identifyStatus.textContent = force ? "A gravar WAV para o Shazam..." : "A verificar música...";
+    identifyStatus.textContent = force ? "A gravar MP3 320 kbps para o Shazam..." : "A verificar música...";
     identifyBtn.disabled = true;
     identifyBtn.textContent = "⏳";
 

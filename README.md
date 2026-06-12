@@ -1,25 +1,24 @@
-# Radio Indie88 FM — Vercel V6
+# Radio Indie88 FM — V7 MP3 320 kbps
 
-Esta versão usa a mesma lógica de identificação que funcionou nas outras rádios:
+Versão preparada para Vercel com identificação por Shazam usando uma amostra MP3 real em `/tmp`.
 
-1. `imageio-ffmpeg` fornece o binário FFmpeg dentro do pacote Python.
-2. A Function grava uma amostra WAV PCM em `/tmp`.
-3. O WAV é normalizado para mono, 44.1 kHz e enviado ao Shazam.
-4. A capa é procurada no iTunes e, se falhar, usa a capa do Shazam ou a capa default.
+## Formato da amostra
 
-## Publicação
-
-Coloca todos os ficheiros na raiz do repositório e faz novo deploy sem alterar Build Command ou Output Directory.
-
-## Testes
-
-- `/api/health` deve mostrar `ffmpeg_available: true`.
-- `/api/stream-check` deve mostrar `ok: true` e `bytes_received` maior que zero.
-- `/api/identify?force=1` executa uma identificação completa.
+- Duração: 22 segundos por omissão
+- Codec: MP3 / libmp3lame
+- Bitrate: CBR 320 kbps
+- Frequência: 44.1 kHz
+- Canais: estéreo
+- Binário FFmpeg: incluído pelo `imageio-ffmpeg`
 
 ## Variáveis opcionais
 
-- `RADIO_STREAM`
-- `RADIO_NAME`
-- `SHAZAM_SAMPLE_SECONDS` (10 a 22, predefinição 18)
-- `IDENTIFY_CACHE_SECONDS`
+- `SHAZAM_SAMPLE_SECONDS`: entre 12 e 28
+- `SHAZAM_MP3_BITRATE_KBPS`: entre 192 e 320
+- `IDENTIFY_CACHE_SECONDS`: entre 20 e 180
+
+## Diagnóstico
+
+Abra `/api/health` depois do deploy. O build esperado é:
+
+`indie88-vercel-v7-mp3-320k-20260612`

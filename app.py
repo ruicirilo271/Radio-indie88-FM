@@ -24,7 +24,7 @@ app = Flask(
     static_folder=None,
 )
 
-BUILD_ID = "indie88-vercel-v6-logica-cascais-20260612"
+BUILD_ID = "indie88-vercel-v7-mp3-320k-20260612"
 
 RADIO_NAME = os.getenv("RADIO_NAME", "Radio Indie88 FM").strip()
 RADIO_STREAM = os.getenv(
@@ -41,10 +41,13 @@ def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
-# Mesma lógica da versão funcional: ficheiro WAV real em /tmp.
-CAPTURE_SECONDS = env_int("SHAZAM_SAMPLE_SECONDS", 18, 10, 22)
+# Amostra MP3 de alta qualidade criada em /tmp para o Shazam.
+CAPTURE_SECONDS = env_int("SHAZAM_SAMPLE_SECONDS", 22, 12, 28)
+MP3_BITRATE_KBPS = env_int("SHAZAM_MP3_BITRATE_KBPS", 320, 192, 320)
+MP3_SAMPLE_RATE = 44_100
+MP3_CHANNELS = 2
 IDENTIFY_CACHE_SECONDS = env_int("IDENTIFY_CACHE_SECONDS", 55, 20, 180)
-MIN_SAMPLE_BYTES = 180_000
+MIN_SAMPLE_BYTES = 300_000
 DEFAULT_COVER = "/default-cover.webp"
 
 identify_lock = Lock()
@@ -80,20 +83,36 @@ def ffmpeg_path() -> str:
 
 def create_sample_path() -> Path:
     stamp = f"{os.getpid()}_{int(time.time() * 1000)}"
-    return Path(tempfile.gettempdir()) / f"indie88_shazam_{stamp}.wav"
+    return Path(tempfile.gettempdir()) / f"indie88_shazam_{stamp}.mp3"
+
+
+def looks_like_mp3(path: Path) -> bool:
+    """Confirma que o ficheiro contém um cabeçalho ID3 ou frames MPEG válidos."""
+    try:
+        data = path.read_bytes()[:65_536]
+    except OSError:
+        return False
+
+    if data.startswith(b"ID3"):
+        return True
+
+    return any(
+        data[index] == 0xFF and (data[index + 1] & 0xE0) == 0xE0
+        for index in range(max(0, len(data) - 1))
+    )
 
 
 def capture_stream(output_file: Path, seconds: int = CAPTURE_SECONDS) -> dict[str, Any]:
     """
-    Grava áudio real da rádio num WAV PCM em /tmp.
+    Grava a emissão num MP3 CBR de alta qualidade em /tmp.
 
-    Esta é a mesma estratégia da aplicação que funcionou:
-    imageio-ffmpeg -> WAV mono 44.1 kHz -> ficheiro enviado ao Shazam.
+    O ficheiro final é estéreo, 44.1 kHz e 320 kbps por omissão.
+    O FFmpeg vem dentro do pacote imageio-ffmpeg.
     """
     errors: list[str] = []
 
     for attempt in range(1, 3):
-        attempt_seconds = seconds if attempt == 1 else max(12, seconds - 3)
+        attempt_seconds = seconds if attempt == 1 else max(16, seconds - 4)
         output_file.unlink(missing_ok=True)
 
         command = [
@@ -110,8 +129,9 @@ def capture_stream(output_file: Path, seconds: int = CAPTURE_SECONDS) -> dict[st
             "Icy-MetaData: 0\r\n"
             "Accept-Encoding: identity\r\n"
             "Cache-Control: no-cache\r\n",
-            "-rw_timeout", "12000000",
+            "-rw_timeout", "20000000",
             "-reconnect", "1",
+            "-reconnect_at_eof", "1",
             "-reconnect_streamed", "1",
             "-reconnect_on_network_error", "1",
             "-reconnect_on_http_error", "4xx,5xx",
@@ -120,10 +140,16 @@ def capture_stream(output_file: Path, seconds: int = CAPTURE_SECONDS) -> dict[st
             "-t", str(attempt_seconds),
             "-vn",
             "-map_metadata", "-1",
-            "-af", "highpass=f=80,lowpass=f=15000,loudnorm=I=-16:TP=-1.5:LRA=11",
-            "-ac", "1",
-            "-ar", "44100",
-            "-c:a", "pcm_s16le",
+            "-af",
+            "highpass=f=35,lowpass=f=18000,"
+            "loudnorm=I=-14:TP=-1.0:LRA=9",
+            "-ac", str(MP3_CHANNELS),
+            "-ar", str(MP3_SAMPLE_RATE),
+            "-c:a", "libmp3lame",
+            "-b:a", f"{MP3_BITRATE_KBPS}k",
+            "-compression_level", "0",
+            "-id3v2_version", "3",
+            "-write_xing", "1",
             str(output_file),
         ]
 
@@ -133,25 +159,30 @@ def capture_stream(output_file: Path, seconds: int = CAPTURE_SECONDS) -> dict[st
                 command,
                 capture_output=True,
                 text=True,
-                timeout=attempt_seconds + 15,
+                timeout=attempt_seconds + 22,
                 check=False,
             )
             elapsed = round(time.monotonic() - started, 2)
             size = output_file.stat().st_size if output_file.exists() else 0
+            valid_mp3 = output_file.exists() and looks_like_mp3(output_file)
 
-            if result.returncode == 0 and size >= MIN_SAMPLE_BYTES:
+            if result.returncode == 0 and size >= MIN_SAMPLE_BYTES and valid_mp3:
                 return {
                     "attempt": attempt,
                     "seconds": attempt_seconds,
                     "sample_bytes": size,
                     "capture_elapsed": elapsed,
-                    "format": "wav-pcm-s16le-mono-44100",
+                    "format": f"mp3-cbr-{MP3_BITRATE_KBPS}k-stereo-{MP3_SAMPLE_RATE}",
+                    "bitrate_kbps": MP3_BITRATE_KBPS,
+                    "sample_rate": MP3_SAMPLE_RATE,
+                    "channels": MP3_CHANNELS,
+                    "mp3_valid": True,
                 }
 
             detail = (result.stderr or "O stream não forneceu áudio suficiente.").strip()
             errors.append(
                 f"tentativa {attempt}: retorno={result.returncode}, bytes={size}, "
-                f"detalhe={detail[-600:]}"
+                f"mp3_valido={valid_mp3}, detalhe={detail[-700:]}"
             )
         except subprocess.TimeoutExpired:
             errors.append(f"tentativa {attempt}: tempo limite da captura")
@@ -162,16 +193,22 @@ def capture_stream(output_file: Path, seconds: int = CAPTURE_SECONDS) -> dict[st
             time.sleep(1.5)
 
     output_file.unlink(missing_ok=True)
-    raise RuntimeError("Não consegui criar uma amostra WAV válida. " + " | ".join(errors))
+    raise RuntimeError(
+        "Não consegui criar uma amostra MP3 320 kbps válida. " + " | ".join(errors)
+    )
 
 
 async def recognize_file(audio_file: Path) -> dict[str, Any]:
+    audio_bytes = audio_file.read_bytes()
+    if len(audio_bytes) < MIN_SAMPLE_BYTES or not looks_like_mp3(audio_file):
+        raise RuntimeError("A amostra MP3 está incompleta ou inválida.")
+
     shazam = Shazam(
         language="en-US",
         endpoint_country="CA",
-        segment_duration_seconds=min(10, CAPTURE_SECONDS),
+        segment_duration_seconds=min(12, CAPTURE_SECONDS),
     )
-    return await asyncio.wait_for(shazam.recognize(str(audio_file)), timeout=30)
+    return await asyncio.wait_for(shazam.recognize(audio_bytes), timeout=38)
 
 
 def run_shazam(audio_file: Path) -> dict[str, Any]:
@@ -327,7 +364,7 @@ def identify_current_song(force: bool = False) -> dict[str, Any]:
             if not track and force:
                 audio_file.unlink(missing_ok=True)
                 time.sleep(1.5)
-                second_info = capture_stream(audio_file, seconds=max(12, CAPTURE_SECONDS - 3))
+                second_info = capture_stream(audio_file, seconds=max(18, CAPTURE_SECONDS - 2))
                 sample_info = {
                     **second_info,
                     "recognition_attempt": 2,
@@ -362,7 +399,7 @@ def identify_current_song(force: bool = False) -> dict[str, Any]:
                 "itunes_cover": itunes_cover,
                 "shazam_url": track.get("shazam_url", ""),
                 "source": source,
-                "message": "Música identificada pelo Shazam a partir de uma amostra WAV real.",
+                "message": "Música identificada pelo Shazam a partir de uma amostra MP3 320 kbps.",
                 "build": BUILD_ID,
                 **sample_info,
             }
@@ -496,12 +533,15 @@ def api_health():
         "platform": "vercel" if os.getenv("VERCEL") else "local",
         "stream_configured": bool(RADIO_STREAM),
         "capture_seconds": CAPTURE_SECONDS,
-        "identification_mode": "tmp-wav-imageio-ffmpeg",
+        "identification_mode": "tmp-mp3-320k-imageio-ffmpeg",
         "ffmpeg_available": available,
         "ffmpeg_path": binary,
         "ffmpeg_error": ffmpeg_error,
         "build": BUILD_ID,
-        "recognizer": "shazamio-file-wav",
+        "recognizer": "shazamio-mp3-bytes",
+        "mp3_bitrate_kbps": MP3_BITRATE_KBPS,
+        "mp3_sample_rate": MP3_SAMPLE_RATE,
+        "mp3_channels": MP3_CHANNELS,
     }), (200 if available else 503)
 
 
