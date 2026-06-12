@@ -1,25 +1,15 @@
-import asyncio
+import html
 import os
-import subprocess
-import tempfile
+import re
 import time
-from functools import lru_cache
+import unicodedata
+from html.parser import HTMLParser
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import requests
-from aiohttp_retry import ExponentialRetry
-from flask import (
-    Flask,
-    after_this_request,
-    jsonify,
-    render_template,
-    send_file,
-    send_from_directory,
-)
-from imageio_ffmpeg import get_ffmpeg_exe
-from shazamio import Shazam
-from shazamio.client import HTTPClient
+from flask import Flask, jsonify, render_template, send_from_directory
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -31,232 +21,267 @@ app = Flask(
     static_folder=None,
 )
 
-BUILD_ID = "indie88-vercel-v8-logica-m80-20260612"
+BUILD_ID = "indie88-vercel-v9-metadata-oficial-20260612"
 RADIO_NAME = os.getenv("RADIO_NAME", "Radio Indie88 FM").strip()
 STREAM_URL = os.getenv(
     "RADIO_STREAM",
     "https://localradio.streamb.live/SB00348",
 ).strip()
+OFFICIAL_PLAYER_URL = os.getenv(
+    "INDIE88_PLAYER_URL",
+    "https://www.indie88.com/player/",
+).strip()
 DEFAULT_COVER = "/default-cover.webp"
 
-# Estes valores são iguais aos que funcionam na aplicação M80 Ballads.
-CAPTURE_SECONDS = 12
-SHAZAM_SEGMENT_SECONDS = 10
-MP3_BITRATE = "128k"
-SAMPLE_RATE = 44_100
-AUDIO_CHANNELS = 1
-MIN_MP3_BYTES = 80_000
+METADATA_CACHE_SECONDS = 20
+STALE_CACHE_SECONDS = 180
 
-STREAM_HEADERS = {
+BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/149.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/149.0.0.0 Safari/537.36"
     ),
-    "Accept": "audio/aac,audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-CA,en;q=0.9,pt-PT;q=0.7,pt;q=0.6",
     "Accept-Encoding": "identity",
-    "Icy-MetaData": "0",
     "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
+metadata_lock = Lock()
+metadata_cache: dict[str, Any] = {
+    "ts": 0.0,
+    "track": None,
 }
 
 
-def ffmpeg_path() -> str:
-    """Binário FFmpeg incluído no pacote imageio-ffmpeg."""
-    binary = get_ffmpeg_exe()
-    if not binary or not Path(binary).exists():
-        raise RuntimeError("O binário FFmpeg do imageio-ffmpeg não foi encontrado.")
-    return binary
+class VisibleTextParser(HTMLParser):
+    """Extrai texto visível sem depender de BeautifulSoup."""
+
+    IGNORED_TAGS = {"script", "style", "noscript", "svg", "template"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._ignored_depth = 0
+        self.items: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() in self.IGNORED_TAGS:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in self.IGNORED_TAGS and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
+        value = re.sub(r"\s+", " ", html.unescape(data or "")).strip()
+        if value:
+            self.items.append(value)
 
 
-@lru_cache(maxsize=1)
-def ffmpeg_supports_mp3() -> bool:
-    try:
-        result = subprocess.run(
-            [ffmpeg_path(), "-hide_banner", "-encoders"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        output = f"{result.stdout}\n{result.stderr}".lower()
-        return "libmp3lame" in output
-    except Exception:
+TIME_PATTERN = re.compile(r"^(?:0?[1-9]|1[0-2]):[0-5]\d\s*(?:AM|PM)$", re.I)
+SKIP_TEXTS = {
+    "play",
+    "stop",
+    "image",
+    "facebook",
+    "instagram",
+    "youtube",
+    "tiktok",
+    "privacy policy",
+    "terms of service",
+    "indie 88 website",
+    "indie88 website",
+}
+
+
+def normalize_space(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def normalize_search_text(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    value = re.sub(r"[^a-zA-Z0-9]+", " ", value).lower()
+    return " ".join(value.split())
+
+
+def is_song_text_candidate(value: str) -> bool:
+    value = normalize_space(value)
+    lowered = value.lower()
+
+    if not value or len(value) > 160:
+        return False
+    if TIME_PATTERN.fullmatch(value):
+        return False
+    if lowered in SKIP_TEXTS:
+        return False
+    if lowered.startswith(("http://", "https://", "copyright", "your program will resume")):
+        return False
+    if lowered in {"indie 88", "indie88", "radio indie88 fm"}:
+        return False
+    if re.fullmatch(r"[\W_]+", value):
         return False
 
+    return True
 
-def normalize_track(track: Any) -> dict[str, Any] | None:
-    if not isinstance(track, dict):
-        return None
 
-    title = str(track.get("title") or "").strip()
-    artist = str(track.get("subtitle") or track.get("artist") or "").strip()
+def parse_official_player(page_html: str) -> dict[str, Any]:
+    parser = VisibleTextParser()
+    parser.feed(page_html)
+    tokens = [normalize_space(item) for item in parser.items if normalize_space(item)]
 
-    if not title:
-        return None
-    if not artist:
-        artist = "Artista desconhecido"
-
-    images = track.get("images") or {}
-    cover = DEFAULT_COVER
-    if isinstance(images, dict):
-        cover = (
-            images.get("coverarthq")
-            or images.get("coverart")
-            or images.get("background")
-            or DEFAULT_COVER
-        )
-
-    album = ""
-    for section in track.get("sections") or []:
-        if not isinstance(section, dict):
+    # O player oficial apresenta cada registo na ordem:
+    # hora -> artista -> título. O primeiro registo é a música atual.
+    for index, token in enumerate(tokens):
+        if not TIME_PATTERN.fullmatch(token):
             continue
-        for item in section.get("metadata") or []:
-            if not isinstance(item, dict):
-                continue
-            key = str(item.get("title") or "").lower()
-            value = str(item.get("text") or "").strip()
-            if "album" in key and value:
-                album = value
+
+        candidates: list[str] = []
+        for next_token in tokens[index + 1:index + 12]:
+            if is_song_text_candidate(next_token):
+                candidates.append(next_token)
+            if len(candidates) == 2:
                 break
-        if album:
-            break
 
-    now = int(time.time())
-    return {
-        "title": title,
-        "artist": artist,
-        "album": album,
-        "cover": str(cover),
-        "shazam_url": str(track.get("url") or ""),
-        "identified_at": now,
-        "played_at": now,
-    }
-
-
-def build_capture_command(output_file: Path, seconds: int) -> list[str]:
-    """Comando copiado da lógica funcional da M80 Ballads."""
-    return [
-        ffmpeg_path(),
-        "-hide_banner",
-        "-loglevel", "error",
-        "-nostdin",
-        "-y",
-
-        "-user_agent", STREAM_HEADERS["User-Agent"],
-        "-headers",
-        "Accept: audio/aac,audio/mpeg,audio/*;q=0.9,*/*;q=0.8\r\n"
-        "Icy-MetaData: 0\r\n"
-        "Accept-Encoding: identity\r\n"
-        "Connection: close\r\n",
-
-        "-rw_timeout", "6500000",
-        "-reconnect", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_on_network_error", "1",
-        "-reconnect_on_http_error", "4xx,5xx",
-        "-reconnect_delay_max", "2",
-
-        "-i", STREAM_URL,
-        "-t", str(seconds),
-        "-vn",
-
-        # Filtros leves iguais aos da M80. Sem loudnorm e sem estéreo pesado.
-        "-af", "highpass=f=70,lowpass=f=15000,volume=1.35",
-        "-ac", str(AUDIO_CHANNELS),
-        "-ar", str(SAMPLE_RATE),
-
-        "-c:a", "libmp3lame",
-        "-b:a", MP3_BITRATE,
-        "-map_metadata", "-1",
-        "-id3v2_version", "0",
-        "-write_xing", "0",
-        "-f", "mp3",
-        str(output_file),
-    ]
-
-
-def capture_stream_mp3(output_file: Path) -> dict[str, Any]:
-    """Grava uma única amostra MP3 de 12 segundos em /tmp."""
-    output_file.unlink(missing_ok=True)
-    command = build_capture_command(output_file, CAPTURE_SECONDS)
-
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        size = output_file.stat().st_size if output_file.exists() else 0
-        if size >= MIN_MP3_BYTES:
+        if len(candidates) == 2:
+            artist, title = candidates
             return {
-                "format": "mp3",
-                "bitrate": MP3_BITRATE,
-                "sample_rate": SAMPLE_RATE,
-                "channels": AUDIO_CHANNELS,
-                "bytes": size,
-                "seconds": CAPTURE_SECONDS,
-                "ffmpeg_returncode": "timeout-com-amostra-valida",
+                "title": title,
+                "artist": artist,
+                "album": "",
+                "cover": DEFAULT_COVER,
+                "official_time": token.upper(),
+                "source": "indie88-official-player",
+                "identified_at": int(time.time()),
+                "played_at": int(time.time()),
             }
-        raise RuntimeError(
-            "A captura MP3 excedeu o tempo disponível e não produziu "
-            f"áudio suficiente ({size} bytes)."
-        )
-
-    size = output_file.stat().st_size if output_file.exists() else 0
-
-    # Tal como na M80: aceita o MP3 completo mesmo que o servidor feche a ligação
-    # e o FFmpeg devolva um código diferente de zero.
-    if size >= MIN_MP3_BYTES:
-        return {
-            "format": "mp3",
-            "bitrate": MP3_BITRATE,
-            "sample_rate": SAMPLE_RATE,
-            "channels": AUDIO_CHANNELS,
-            "bytes": size,
-            "seconds": CAPTURE_SECONDS,
-            "ffmpeg_returncode": result.returncode,
-        }
-
-    detail = (
-        result.stderr
-        or result.stdout
-        or "O stream não enviou áudio MP3 suficiente."
-    ).strip()
 
     raise RuntimeError(
-        "Não foi possível criar uma amostra MP3 válida da Indie88. "
-        f"Tamanho: {size} bytes. Detalhe: {detail[-600:]}"
+        "A página oficial abriu, mas não foi possível localizar artista e título."
     )
 
 
-async def recognize_mp3(audio_file: Path) -> dict[str, Any] | None:
-    """Reconhecimento com os mesmos limites e retries da M80 Ballads."""
-    audio_bytes = audio_file.read_bytes()
-    if len(audio_bytes) < MIN_MP3_BYTES:
-        raise RuntimeError("A amostra MP3 ficou demasiado pequena para identificar.")
+def artwork_600(url: str) -> str:
+    if not url:
+        return ""
+    return re.sub(r"\d+x\d+bb", "600x600bb", url)
 
-    retry_options = ExponentialRetry(
-        attempts=2,
-        max_timeout=2,
-        statuses={429, 500, 502, 503, 504},
-    )
-    http_client = HTTPClient(retry_options=retry_options)
-    shazam = Shazam(
-        language="en-US",
-        endpoint_country="CA",
-        http_client=http_client,
-        segment_duration_seconds=SHAZAM_SEGMENT_SECONDS,
-    )
 
-    result = await asyncio.wait_for(
-        shazam.recognize(audio_bytes),
-        timeout=14,
-    )
+def get_itunes_data(title: str, artist: str) -> tuple[str, str]:
+    """Procura capa e álbum sem bloquear a identificação em caso de falha."""
+    try:
+        response = requests.get(
+            "https://itunes.apple.com/search",
+            params={
+                "term": f"{artist} {title}",
+                "media": "music",
+                "entity": "song",
+                "limit": 8,
+                "country": "CA",
+            },
+            headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
+            timeout=(3.5, 6),
+        )
+        response.raise_for_status()
+        results = response.json().get("results") or []
+    except Exception:
+        return "", ""
 
-    track = result.get("track") if isinstance(result, dict) else None
-    return normalize_track(track)
+    wanted_title = normalize_search_text(title)
+    wanted_artist = normalize_search_text(artist)
+    best_item: dict[str, Any] | None = None
+    best_score = -1
+
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+
+        found_title = normalize_search_text(str(item.get("trackName") or ""))
+        found_artist = normalize_search_text(str(item.get("artistName") or ""))
+        score = 0
+
+        if found_title == wanted_title:
+            score += 8
+        elif wanted_title and (wanted_title in found_title or found_title in wanted_title):
+            score += 4
+
+        if found_artist == wanted_artist:
+            score += 8
+        elif wanted_artist and (wanted_artist in found_artist or found_artist in wanted_artist):
+            score += 4
+
+        if score > best_score:
+            best_score = score
+            best_item = item
+
+    if not best_item or best_score < 4:
+        return "", ""
+
+    cover = artwork_600(str(best_item.get("artworkUrl100") or ""))
+    album = str(best_item.get("collectionName") or "").strip()
+    return cover, album
+
+
+def fetch_official_now_playing(force: bool = False) -> dict[str, Any]:
+    global metadata_cache
+
+    now = time.time()
+    cached_track = metadata_cache.get("track")
+    cached_ts = float(metadata_cache.get("ts") or 0)
+
+    if not force and cached_track and now - cached_ts < METADATA_CACHE_SECONDS:
+        return dict(cached_track)
+
+    with metadata_lock:
+        now = time.time()
+        cached_track = metadata_cache.get("track")
+        cached_ts = float(metadata_cache.get("ts") or 0)
+
+        if not force and cached_track and now - cached_ts < METADATA_CACHE_SECONDS:
+            return dict(cached_track)
+
+        try:
+            response = requests.get(
+                OFFICIAL_PLAYER_URL,
+                params={"playerID": "3446", "_": int(now)},
+                headers=BROWSER_HEADERS,
+                timeout=(5, 12),
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+
+            content_type = response.headers.get("Content-Type", "")
+            if "html" not in content_type.lower() and not response.text.lstrip().startswith("<"):
+                raise RuntimeError(
+                    f"A página oficial devolveu um conteúdo inesperado: {content_type or 'desconhecido'}."
+                )
+
+            track = parse_official_player(response.text)
+            cover, album = get_itunes_data(track["title"], track["artist"])
+            track["cover"] = cover or DEFAULT_COVER
+            track["album"] = album
+            track["official_url"] = OFFICIAL_PLAYER_URL
+            track["stale"] = False
+
+            metadata_cache = {
+                "ts": time.time(),
+                "track": dict(track),
+            }
+            return track
+
+        except Exception:
+            # Se a página oficial tiver uma falha momentânea, mantém a última
+            # música confirmada durante três minutos em vez de apagar o player.
+            if cached_track and now - cached_ts < STALE_CACHE_SECONDS:
+                stale_track = dict(cached_track)
+                stale_track["stale"] = True
+                stale_track["source"] = "indie88-official-player-cache"
+                return stale_track
+            raise
 
 
 @app.after_request
@@ -276,7 +301,7 @@ def index():
             "name": RADIO_NAME,
             "stream": STREAM_URL,
             "defaultCover": DEFAULT_COVER,
-            "identifySeconds": CAPTURE_SECONDS,
+            "identifySeconds": 0,
             "build": BUILD_ID,
         },
     )
@@ -311,128 +336,92 @@ def api_radio():
     })
 
 
-@app.post("/api/identify")
+@app.route("/api/identify", methods=["GET", "POST"])
+@app.route("/api/identify/force", methods=["GET", "POST"])
 def identify():
     started = time.perf_counter()
-    timings: dict[str, float] = {}
-    stage = "preparar"
-    stamp = f"{os.getpid()}_{int(time.time() * 1000)}"
-    audio_file = Path(tempfile.gettempdir()) / f"indie88_{stamp}.mp3"
 
     try:
-        stage = "capturar_mp3"
-        phase = time.perf_counter()
-        sample = capture_stream_mp3(audio_file)
-        timings["capture"] = round(time.perf_counter() - phase, 3)
-
-        stage = "shazam"
-        phase = time.perf_counter()
-        track = asyncio.run(recognize_mp3(audio_file))
-        timings["shazam"] = round(time.perf_counter() - phase, 3)
-        timings["total"] = round(time.perf_counter() - started, 3)
-
-        if not track:
-            return jsonify({
-                "ok": False,
-                "track": None,
-                "stage": "shazam_sem_correspondencia",
-                "sample": sample,
-                "timings": timings,
-                "build": BUILD_ID,
-                "error": (
-                    "O Shazam recebeu a amostra MP3, mas não reconheceu esta "
-                    "parte da emissão. Tenta novamente dentro de alguns segundos."
-                ),
-            }), 422
-
+        track = fetch_official_now_playing(force=True)
+        elapsed = round(time.perf_counter() - started, 3)
         return jsonify({
             "ok": True,
             "track": track,
-            "sample": sample,
-            "timings": timings,
+            "stage": "official_now_playing",
+            "source": track.get("source"),
+            "timings": {"total": elapsed},
             "build": BUILD_ID,
         })
-
-    except asyncio.TimeoutError:
-        timings["total"] = round(time.perf_counter() - started, 3)
-        return jsonify({
-            "ok": False,
-            "track": None,
-            "stage": stage,
-            "timings": timings,
-            "build": BUILD_ID,
-            "error": "O pedido ao Shazam excedeu o tempo disponível.",
-        }), 504
-
     except Exception as exc:
-        timings["total"] = round(time.perf_counter() - started, 3)
+        elapsed = round(time.perf_counter() - started, 3)
         return jsonify({
             "ok": False,
             "track": None,
-            "stage": stage,
-            "timings": timings,
+            "stage": "official_now_playing",
+            "timings": {"total": elapsed},
             "build": BUILD_ID,
             "error": f"{type(exc).__name__}: {exc}",
         }), 503
 
-    finally:
-        try:
-            audio_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+
+@app.get("/api/official-now-playing")
+def official_now_playing():
+    try:
+        track = fetch_official_now_playing(force=True)
+        return jsonify({
+            "ok": True,
+            "track": track,
+            "build": BUILD_ID,
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "build": BUILD_ID,
+        }), 503
 
 
 @app.get("/api/sample")
-def download_sample():
-    """Cria a mesma amostra usada pelo Shazam para ser ouvida no navegador."""
-    stamp = f"{os.getpid()}_{int(time.time() * 1000)}"
-    audio_file = Path(tempfile.gettempdir()) / f"indie88_test_{stamp}.mp3"
-
-    try:
-        capture_stream_mp3(audio_file)
-
-        @after_this_request
-        def remove_file(response):
-            try:
-                audio_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return response
-
-        return send_file(
-            audio_file,
-            mimetype="audio/mpeg",
-            as_attachment=True,
-            download_name="indie88-amostra-shazam.mp3",
-            max_age=0,
-        )
-    except Exception as exc:
-        try:
-            audio_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return jsonify({
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "build": BUILD_ID,
-        }), 503
+def sample_disabled():
+    return jsonify({
+        "ok": False,
+        "disabled": True,
+        "reason": (
+            "A amostra MP3 foi desativada porque o servidor do stream entrega "
+            "uma mensagem de indisponibilidade ao Vercel em vez da música."
+        ),
+        "identification_mode": "official-now-playing-metadata",
+        "build": BUILD_ID,
+    }), 410
 
 
 @app.get("/api/stream-check")
 def stream_check():
+    """Verifica apenas transporte; não afirma que o conteúdo seja música."""
     response = None
     try:
         response = requests.get(
             STREAM_URL,
-            headers=STREAM_HEADERS,
+            headers={
+                "User-Agent": BROWSER_HEADERS["User-Agent"],
+                "Accept": "audio/aac,audio/mpeg,audio/*;q=0.9,*/*;q=0.8",
+                "Accept-Encoding": "identity",
+                "Icy-MetaData": "0",
+                "Cache-Control": "no-cache",
+            },
             stream=True,
             timeout=(7, 8),
             allow_redirects=True,
         )
         response.raise_for_status()
-        chunk = next(response.iter_content(chunk_size=256), b"")
+        chunk = next(response.iter_content(chunk_size=512), b"")
         return jsonify({
             "ok": bool(chunk),
+            "transport_only": True,
+            "warning": (
+                "O servidor pode devolver áudio de indisponibilidade; este teste "
+                "não confirma que o conteúdo seja a emissão musical."
+            ),
             "status": response.status_code,
             "content_type": response.headers.get("Content-Type", ""),
             "bytes_received": len(chunk),
@@ -450,97 +439,19 @@ def stream_check():
             response.close()
 
 
-@app.get("/api/identify-diagnostics")
-def identify_diagnostics():
-    temp_test = Path(tempfile.gettempdir()) / f"indie88_tmp_test_{os.getpid()}.txt"
-    tmp_writable = False
-    tmp_error = None
-
-    try:
-        temp_test.write_text("ok", encoding="utf-8")
-        tmp_writable = temp_test.read_text(encoding="utf-8") == "ok"
-    except Exception as exc:
-        tmp_error = f"{type(exc).__name__}: {exc}"
-    finally:
-        try:
-            temp_test.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    try:
-        binary = ffmpeg_path()
-        ffmpeg_available = bool(binary and Path(binary).exists())
-    except Exception as exc:
-        binary = None
-        ffmpeg_available = False
-        tmp_error = tmp_error or f"FFmpeg: {type(exc).__name__}: {exc}"
-
-    return jsonify({
-        "ok": ffmpeg_available and tmp_writable and ffmpeg_supports_mp3(),
-        "platform": "vercel" if os.getenv("VERCEL") else "local",
-        "tmp_directory": tempfile.gettempdir(),
-        "tmp_writable": tmp_writable,
-        "tmp_error": tmp_error,
-        "ffmpeg_available": ffmpeg_available,
-        "ffmpeg_path": binary,
-        "mp3_encoder": ffmpeg_supports_mp3(),
-        "sample_format": "mp3",
-        "capture_seconds": CAPTURE_SECONDS,
-        "shazam_segment_seconds": SHAZAM_SEGMENT_SECONDS,
-        "mp3_bitrate": MP3_BITRATE,
-        "sample_rate": SAMPLE_RATE,
-        "channels": AUDIO_CHANNELS,
-        "minimum_sample_bytes": MIN_MP3_BYTES,
-        "build": BUILD_ID,
-    })
-
-
-@app.get("/api/warmup")
-def warmup():
-    started = time.perf_counter()
-    try:
-        binary = ffmpeg_path()
-        available = bool(binary and Path(binary).exists())
-        return jsonify({
-            "ok": available,
-            "ffmpeg_available": available,
-            "elapsed": round(time.perf_counter() - started, 3),
-            "build": BUILD_ID,
-        })
-    except Exception as exc:
-        return jsonify({
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "elapsed": round(time.perf_counter() - started, 3),
-            "build": BUILD_ID,
-        }), 503
-
-
 @app.get("/api/health")
 @app.get("/health")
 def health():
-    try:
-        binary = ffmpeg_path()
-        ffmpeg_available = bool(binary and Path(binary).exists())
-    except Exception:
-        binary = None
-        ffmpeg_available = False
-
     return jsonify({
         "ok": True,
         "platform": "vercel" if os.getenv("VERCEL") else "local",
         "radio": RADIO_NAME,
         "stream": STREAM_URL,
-        "identification_sample": "mp3",
-        "identification_logic": "same-as-m80-ballads",
-        "ffmpeg_available": ffmpeg_available,
-        "ffmpeg_path": binary,
-        "capture_seconds": CAPTURE_SECONDS,
-        "shazam_segment_seconds": SHAZAM_SEGMENT_SECONDS,
-        "mp3_bitrate": MP3_BITRATE,
-        "sample_rate": SAMPLE_RATE,
-        "channels": AUDIO_CHANNELS,
-        "tmp_directory": tempfile.gettempdir(),
+        "official_player": OFFICIAL_PLAYER_URL,
+        "identification_mode": "official-now-playing-metadata",
+        "ffmpeg_required": False,
+        "shazam_required": False,
+        "metadata_cache_seconds": METADATA_CACHE_SECONDS,
         "build": BUILD_ID,
     })
 

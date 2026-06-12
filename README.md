@@ -1,17 +1,23 @@
-# Radio Indie88 FM — V8 (lógica M80 Ballads)
+# Radio Indie88 FM — V9 (metadados oficiais)
 
-Esta versão usa a mesma lógica de identificação da aplicação M80 Ballads:
+Esta versão deixa de enviar ao Shazam a mensagem de indisponibilidade devolvida pelo stream ao servidor do Vercel.
 
-- uma única amostra MP3;
-- 12 segundos;
-- 128 kbps;
-- mono;
-- 44.1 kHz;
-- filtros leves `highpass`, `lowpass` e `volume`;
-- sem `loudnorm`;
-- sem segunda captura automática;
-- cliente Shazam limitado a duas tentativas curtas;
-- pedido `POST /api/identify` sempre novo, sem cache de falhas.
+A identificação passa a consultar o player oficial da Indie88 e extrai diretamente:
+
+- hora oficial;
+- artista;
+- título da música;
+- capa e álbum através do iTunes, quando disponíveis.
+
+## Vantagens
+
+- identificação rápida;
+- sem FFmpeg;
+- sem gravações em `/tmp`;
+- sem Shazam;
+- menos memória e menor duração da Function;
+- atualização automática a cada 30 segundos;
+- histórico e Top 10 continuam no `localStorage` do navegador.
 
 ## Estrutura
 
@@ -26,10 +32,11 @@ templates/
 ## Diagnóstico
 
 - `/api/health`
-- `/api/identify-diagnostics`
-- `/api/stream-check`
-- `/api/sample` — descarrega a amostra MP3 que seria enviada ao Shazam
+- `/api/official-now-playing`
+- `/api/identify`
+- `/api/stream-check` — verifica apenas se chegam bytes; não confirma que sejam música
+- `/api/sample` — explica por que a antiga amostra foi desativada
 
 ## Publicação
 
-Coloca todos os ficheiros na raiz do repositório e faz um novo deploy no Vercel.
+Substitui todos os ficheiros na raiz do repositório e faz um novo deploy no Vercel.

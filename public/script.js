@@ -205,14 +205,14 @@ async function identifySong(silent = false) {
 
   identifyInProgress = true;
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 42_000);
+  const timeout = window.setTimeout(() => controller.abort(), 15_000);
 
   try {
-    identifyStatus.textContent = "A gravar 12 segundos em MP3...";
+    identifyStatus.textContent = "A consultar a Indie88...";
     identifyBtn.disabled = true;
     identifyBtn.textContent = "⏳";
 
-    const response = await fetch("/api/identify", {
+    const response = await fetch(`/api/identify?nocache=${Date.now()}`, {
       method: "POST",
       cache: "no-store",
       signal: controller.signal,
@@ -234,14 +234,11 @@ async function identifySong(silent = false) {
     if (!response.ok || !data.ok || !data.track) {
       const stage = data.stage ? ` [fase: ${data.stage}]` : "";
       const total = data.timings?.total ? ` (${data.timings.total}s)` : "";
-      const message = `${data.error || "A música não foi reconhecida."}${stage}${total}`;
+      const message = `${data.error || "A música não foi encontrada."}${stage}${total}`;
 
-      identifyStatus.textContent = data.stage === "shazam_sem_correspondencia"
-        ? "Sem correspondência"
-        : "Erro na identificação";
-
+      identifyStatus.textContent = "Informação indisponível";
       if (!silent) toast(message);
-      console.warn("Identificação Indie88:", data);
+      console.warn("Identificação oficial Indie88:", data);
       return;
     }
 
@@ -251,7 +248,10 @@ async function identifySong(silent = false) {
     cover.src = track.cover || config.defaultCover;
 
     const total = data.timings?.total ? ` · ${data.timings.total}s` : "";
-    identifyStatus.textContent = `Identificado pelo Shazam${total}`;
+    identifyStatus.textContent = track.stale
+      ? `Última música confirmada${total}`
+      : `Dados oficiais Indie88${total}`;
+
     addTrackToHistory(track);
   } catch (error) {
     console.error("Erro ao identificar:", error);
@@ -261,8 +261,8 @@ async function identifySong(silent = false) {
 
     if (!silent) {
       toast(error.name === "AbortError"
-        ? "A identificação excedeu o tempo disponível"
-        : (error.message || "Erro ao identificar música"));
+        ? "A consulta à Indie88 excedeu o tempo disponível"
+        : (error.message || "Erro ao consultar a música atual"));
     }
   } finally {
     window.clearTimeout(timeout);
@@ -277,11 +277,11 @@ function startAutoIdentify() {
 
   window.setTimeout(() => {
     if (isPlaying) identifySong(true);
-  }, 8000);
+  }, 2500);
 
   identifyTimer = window.setInterval(() => {
     if (isPlaying) identifySong(true);
-  }, 60_000);
+  }, 30_000);
 }
 
 function stopAutoIdentify() {
