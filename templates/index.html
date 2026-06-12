@@ -10,7 +10,7 @@
 
   <link rel="icon" href="/default-cover.webp" type="image/webp">
   <link rel="preload" href="/default-cover.webp" as="image" type="image/webp">
-  <link rel="stylesheet" href="/style.css?v=4">
+  <link rel="stylesheet" href="/style.css?v={{ config.build }}">
 </head>
 
 <body>
@@ -144,6 +144,6 @@
   <script>
     window.RADIO_CONFIG = {{ config | tojson }};
   </script>
-  <script src="/script.js?v=4" defer></script>
+  <script src="/script.js?v={{ config.build }}" defer></script>
 </body>
 </html>

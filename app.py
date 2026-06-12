@@ -21,7 +21,7 @@ app = Flask(
     static_folder=None,
 )
 
-BUILD_ID = "indie88-vercel-sem-ffmpeg-v4-20260612"
+BUILD_ID = "indie88-vercel-v5-20260612"
 
 RADIO_NAME = os.getenv("RADIO_NAME", "Radio Indie88 FM").strip()
 RADIO_STREAM = os.getenv(

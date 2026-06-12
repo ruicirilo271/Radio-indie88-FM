@@ -1,8 +1,16 @@
-# Radio Indie88 FM — Vercel sem FFmpeg
+# Radio Indie88 FM — Vercel V5
 
-Esta versão usa `shazamio-core` diretamente sobre uma pequena amostra do stream. Não chama `ffmpeg`, `subprocess` nem executáveis externos.
+Esta versão corrige o diagnóstico apresentado durante a identificação.
 
-## Estrutura obrigatória na raiz do repositório
+A versão anterior continha no JavaScript uma mensagem que afirmava que o `app.py` era antigo sempre que o texto do erro incluía a palavra FFmpeg. Essa conclusão não era segura. Agora a aplicação:
+
+- mostra o erro verdadeiro devolvido por `/api/identify`;
+- só avisa sobre versões diferentes quando `config.build` e `data.build` existem e não coincidem;
+- usa o identificador de build também no endereço do CSS e JavaScript para evitar cache antiga;
+- continua a reconhecer bytes diretamente com `shazamio`, sem executar FFmpeg;
+- mantém as capas quadradas e a capa default WebP.
+
+## Estrutura na raiz do repositório
 
 ```text
 app.py
@@ -15,24 +23,23 @@ public/script.js
 public/default-cover.webp
 ```
 
-Não coloques estes ficheiros dentro de outra pasta no GitHub. O ficheiro `app.py` deste pacote tem de substituir o `app.py` antigo existente na raiz.
+## Verificação depois do deploy
 
-## Publicar
+Abre:
 
-1. Apaga ou substitui os ficheiros antigos do repositório.
-2. Copia todo o conteúdo deste pacote para a raiz.
-3. No Vercel abre Deployments e escolhe Redeploy.
-4. Desativa a opção de usar a cache do build, quando for apresentada.
-5. Abre `/api/health`.
+```text
+https://TEU-PROJETO.vercel.app/api/health?t=123
+```
 
 A resposta correta contém:
 
 ```json
 {
+  "ok": true,
+  "build": "indie88-vercel-v5-20260612",
   "ffmpeg_required": false,
-  "build": "indie88-vercel-sem-ffmpeg-v4-20260612",
   "recognizer": "shazamio-core/raw-stream-bytes"
 }
 ```
 
-Se a página ainda mencionar FFmpeg, a produção continua ligada ao código antigo ou o novo projeto está configurado com a Root Directory errada.
+O parâmetro `?t=123` evita que uma resposta anterior guardada em cache confunda o teste.

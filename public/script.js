@@ -229,9 +229,18 @@ async function identifySong(force = false) {
       identifyStatus.textContent = "Não identificado";
 
       const message = String(data.message || "Não foi possível identificar a música.");
-      if (message.toLowerCase().includes("ffmpeg")) {
-        toast("O Vercel ainda está a executar o app.py antigo. Substitui o app.py na raiz e faz Redeploy sem cache.");
+
+      // Só existe incompatibilidade de versões quando ambos os backends
+      // fornecem identificadores e estes são realmente diferentes.
+      if (data.build && config.build && data.build !== config.build) {
+        toast(`Versões diferentes: página ${config.build} / API ${data.build}`);
+        console.warn("Versões diferentes entre a página e a API:", {
+          pagina: config.build,
+          api: data.build,
+          erro: message
+        });
       } else {
+        // Mostra o erro verdadeiro devolvido pelo servidor.
         toast(message);
       }
       return;
@@ -425,10 +434,31 @@ trackTitle.textContent = config.name;
 trackArtist.textContent = "Stream ao vivo";
 streamUrl.textContent = config.stream;
 
-fetch("/api/health", { cache: "no-store" })
-  .then(response => response.json())
-  .then(data => console.info("Indie88 backend:", data.build || "versão antiga", data.recognizer || ""))
-  .catch(() => {});
+async function verifyBackend() {
+  try {
+    const response = await fetch(`/api/health?t=${Date.now()}`, {
+      cache: "no-store",
+      headers: { Accept: "application/json" }
+    });
+
+    if (!response.ok) {
+      console.warn("O endpoint /api/health respondeu com:", response.status);
+      return;
+    }
+
+    const data = await response.json();
+    console.info("Indie88 backend:", data);
+
+    if (data.build && config.build && data.build !== config.build) {
+      identifyStatus.textContent = "Versões diferentes";
+      toast(`A página usa ${config.build}, mas a API usa ${data.build}`);
+    }
+  } catch (error) {
+    console.warn("Não foi possível verificar o backend:", error);
+  }
+}
+
+verifyBackend();
 
 loadVolume();
 renderHistory();
