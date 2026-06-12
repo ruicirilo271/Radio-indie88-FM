@@ -1,24 +1,35 @@
-# Radio Indie88 FM — V7 MP3 320 kbps
+# Radio Indie88 FM — V8 (lógica M80 Ballads)
 
-Versão preparada para Vercel com identificação por Shazam usando uma amostra MP3 real em `/tmp`.
+Esta versão usa a mesma lógica de identificação da aplicação M80 Ballads:
 
-## Formato da amostra
+- uma única amostra MP3;
+- 12 segundos;
+- 128 kbps;
+- mono;
+- 44.1 kHz;
+- filtros leves `highpass`, `lowpass` e `volume`;
+- sem `loudnorm`;
+- sem segunda captura automática;
+- cliente Shazam limitado a duas tentativas curtas;
+- pedido `POST /api/identify` sempre novo, sem cache de falhas.
 
-- Duração: 22 segundos por omissão
-- Codec: MP3 / libmp3lame
-- Bitrate: CBR 320 kbps
-- Frequência: 44.1 kHz
-- Canais: estéreo
-- Binário FFmpeg: incluído pelo `imageio-ffmpeg`
+## Estrutura
 
-## Variáveis opcionais
-
-- `SHAZAM_SAMPLE_SECONDS`: entre 12 e 28
-- `SHAZAM_MP3_BITRATE_KBPS`: entre 192 e 320
-- `IDENTIFY_CACHE_SECONDS`: entre 20 e 180
+```text
+app.py
+requirements.txt
+vercel.json
+public/
+templates/
+```
 
 ## Diagnóstico
 
-Abra `/api/health` depois do deploy. O build esperado é:
+- `/api/health`
+- `/api/identify-diagnostics`
+- `/api/stream-check`
+- `/api/sample` — descarrega a amostra MP3 que seria enviada ao Shazam
 
-`indie88-vercel-v7-mp3-320k-20260612`
+## Publicação
+
+Coloca todos os ficheiros na raiz do repositório e faz um novo deploy no Vercel.

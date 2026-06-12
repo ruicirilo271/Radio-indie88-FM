@@ -200,70 +200,70 @@ function renderTop() {
   });
 }
 
-async function identifySong(force = false) {
+async function identifySong(silent = false) {
   if (identifyInProgress) return;
 
   identifyInProgress = true;
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 150_000);
+  const timeout = window.setTimeout(() => controller.abort(), 42_000);
 
   try {
-    identifyStatus.textContent = force ? "A gravar MP3 320 kbps para o Shazam..." : "A verificar música...";
+    identifyStatus.textContent = "A gravar 12 segundos em MP3...";
     identifyBtn.disabled = true;
     identifyBtn.textContent = "⏳";
 
-    const endpoint = force ? "/api/identify?force=1" : "/api/identify";
-    const response = await fetch(endpoint, {
-      method: force ? "POST" : "GET",
+    const response = await fetch("/api/identify", {
+      method: "POST",
       cache: "no-store",
       signal: controller.signal,
       headers: { Accept: "application/json" }
     });
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+    const contentType = response.headers.get("content-type") || "";
+    let data;
+
+    if (contentType.includes("application/json")) {
+      data = await response.json();
+    } else {
+      const body = await response.text();
+      throw new Error(
+        `A Vercel não devolveu JSON (${response.status}). ${body.slice(0, 180)}`
+      );
     }
 
-    const data = await response.json();
+    if (!response.ok || !data.ok || !data.track) {
+      const stage = data.stage ? ` [fase: ${data.stage}]` : "";
+      const total = data.timings?.total ? ` (${data.timings.total}s)` : "";
+      const message = `${data.error || "A música não foi reconhecida."}${stage}${total}`;
 
-    if (!data.ok) {
-      identifyStatus.textContent = "Não identificado";
+      identifyStatus.textContent = data.stage === "shazam_sem_correspondencia"
+        ? "Sem correspondência"
+        : "Erro na identificação";
 
-      const message = String(data.message || "Não foi possível identificar a música.");
-
-      // Só existe incompatibilidade de versões quando ambos os backends
-      // fornecem identificadores e estes são realmente diferentes.
-      if (data.build && config.build && data.build !== config.build) {
-        toast(`Versões diferentes: página ${config.build} / API ${data.build}`);
-        console.warn("Versões diferentes entre a página e a API:", {
-          pagina: config.build,
-          api: data.build,
-          erro: message
-        });
-      } else {
-        // Mostra o erro verdadeiro devolvido pelo servidor.
-        toast(message);
-      }
+      if (!silent) toast(message);
+      console.warn("Identificação Indie88:", data);
       return;
     }
 
-    trackTitle.textContent = data.title || config.name;
-    trackArtist.textContent = data.artist || "Stream ao vivo";
-    cover.src = data.cover || config.defaultCover;
+    const track = data.track;
+    trackTitle.textContent = track.title || config.name;
+    trackArtist.textContent = track.artist || "Stream ao vivo";
+    cover.src = track.cover || config.defaultCover;
 
-    identifyStatus.textContent = data.source === "itunes"
-      ? "Capa iTunes"
-      : data.source === "shazam"
-        ? "Capa Shazam"
-        : "Identificado";
-
-    addTrackToHistory(data);
+    const total = data.timings?.total ? ` · ${data.timings.total}s` : "";
+    identifyStatus.textContent = `Identificado pelo Shazam${total}`;
+    addTrackToHistory(track);
   } catch (error) {
     console.error("Erro ao identificar:", error);
-    identifyStatus.textContent = error.name === "AbortError" ? "Tempo esgotado" : "Erro";
-    toast(error.name === "AbortError"
-      ? "A identificação demorou demasiado tempo"
-      : "Erro ao identificar música");
+    identifyStatus.textContent = error.name === "AbortError"
+      ? "Tempo esgotado"
+      : "Erro";
+
+    if (!silent) {
+      toast(error.name === "AbortError"
+        ? "A identificação excedeu o tempo disponível"
+        : (error.message || "Erro ao identificar música"));
+    }
   } finally {
     window.clearTimeout(timeout);
     identifyInProgress = false;
@@ -277,10 +277,10 @@ function startAutoIdentify() {
 
   window.setTimeout(() => {
     if (isPlaying) identifySong(true);
-  }, 3500);
+  }, 8000);
 
   identifyTimer = window.setInterval(() => {
-    if (isPlaying) identifySong(false);
+    if (isPlaying) identifySong(true);
   }, 60_000);
 }
 
@@ -399,7 +399,7 @@ async function copyStream() {
 }
 
 playBtn.addEventListener("click", toggleRadio);
-identifyBtn.addEventListener("click", () => identifySong(true));
+identifyBtn.addEventListener("click", () => identifySong(false));
 muteBtn.addEventListener("click", toggleMute);
 reloadBtn.addEventListener("click", reloadStream);
 volumeSlider.addEventListener("input", event => updateVolume(event.target.value));
@@ -435,6 +435,17 @@ trackTitle.textContent = config.name;
 trackArtist.textContent = "Stream ao vivo";
 streamUrl.textContent = config.stream;
 
+async function warmupIdentification() {
+  try {
+    await fetch(`/api/warmup?t=${Date.now()}`, {
+      cache: "no-store",
+      headers: { Accept: "application/json" }
+    });
+  } catch (error) {
+    console.debug("Aquecimento da identificação indisponível:", error);
+  }
+}
+
 async function verifyBackend() {
   try {
     const response = await fetch(`/api/health?t=${Date.now()}`, {
@@ -460,6 +471,7 @@ async function verifyBackend() {
 }
 
 verifyBackend();
+warmupIdentification();
 
 loadVolume();
 renderHistory();
